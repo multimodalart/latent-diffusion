@@ -7,7 +7,7 @@ import numpy as np
 from tqdm.auto import tqdm
 from functools import partial
 from resize_right import resize#, calc_pad_sz
-import interp_methods
+#import interp_methods
 from torchvision.transforms import functional as TF
 
 
