@@ -1,18 +1,10 @@
 """SAMPLING ONLY."""
 
-from cmath import inf
-from pickle import FALSE
 import torch
 import numpy as np
 from tqdm.auto import tqdm
-from functools import partial
-from resize_right import resize#, calc_pad_sz
-#import interp_methods
-from torchvision.transforms import functional as TF
-
-
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
-
+from einops import rearrange
 
 class DDIMSampler(object):
     def __init__(self, model, schedule="linear", **kwargs):
@@ -86,8 +78,7 @@ class DDIMSampler(object):
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
                cond_fn = None,
-#               scale_steps = 0, scale_factor = 1.5, scale_div=8,
-               x_adjust_fn = None,
+               x_adjust_fn = None, x0_adjust_fn = None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -122,7 +113,7 @@ class DDIMSampler(object):
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     cond_fn=cond_fn,
  #                                                   scale_steps = scale_steps, scale_factor = scale_factor, scale_div=scale_div,
-                                                    x_adjust_fn = x_adjust_fn
+                                                    x_adjust_fn = x_adjust_fn, x0_adjust_fn = x0_adjust_fn
                                                     )
         return samples, intermediates
 
@@ -133,7 +124,7 @@ class DDIMSampler(object):
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, cond_fn = None,
-                      scale_steps = 0, scale_factor = 1.5, scale_div=8, x_adjust_fn=None):
+                      scale_steps = 0, scale_factor = 1.5, scale_div=8, x_adjust_fn=None, x0_adjust_fn = None):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -153,37 +144,28 @@ class DDIMSampler(object):
         print(f"Running DDIM Sampling with {total_steps} timesteps")
 
         iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
-            if False:#timesteps[index] > (timesteps[index+1] if i!= 0 else inf):
-                if scale_div:
-                  print("Latent upscale")
-                  img = resize(img, scale_factors=scale_factor, interp_method=interp_methods.linear, antialiasing=False)
-                  img = img * scale_div
-                else:
-                  print("decoded upscale")
-                  img_decoded = self.model.decode_first_stage(img)
-                  img_decoded = resize(img_decoded, scale_factors=scale_factor, interp_method=interp_methods.lanczos3, antialiasing=True)
-                  img = self.model.encode_first_stage(img_decoded).sample() * 0.1815
-            else:
-                if mask is not None:
-                    assert x0 is not None
-                    img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
-                    img = img_orig * torch.where(mask*1000>step,0,1) + (1. - torch.where(mask*1000>step,0,1)) * img
-                img_a = img
-                outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
-                                        quantize_denoised=quantize_denoised, temperature=temperature,
-                                        noise_dropout=noise_dropout, score_corrector=score_corrector,
-                                        corrector_kwargs=corrector_kwargs,
-                                        unconditional_guidance_scale=unconditional_guidance_scale,
-                                        unconditional_conditioning=unconditional_conditioning, cond_fn = cond_fn,
-                                        #scale_steps = scale_steps, scale_factor = scale_factor, scale_div=scale_div,
-                                        x_adjust_fn = x_adjust_fn)
-                img, pred_x0 = outs
-                if torch.any(torch.isnan(img)): img = img_a
-                if callback: callback(i)
-                if img_callback: img_callback(pred_x0, i)
+
+            if mask is not None:
+                assert x0 is not None
+                img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
+                img = img_orig * torch.where(mask*1000>step,0,1) + (1. - torch.where(mask*1000>step,0,1)) * img
+            img_a = img
+            outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
+                                    quantize_denoised=quantize_denoised, temperature=temperature,
+                                    noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                    corrector_kwargs=corrector_kwargs,
+                                    unconditional_guidance_scale=unconditional_guidance_scale,
+                                    unconditional_conditioning=unconditional_conditioning, cond_fn = cond_fn,
+                                    #scale_steps = scale_steps, scale_factor = scale_factor, scale_div=scale_div,
+                                    x_adjust_fn = x_adjust_fn, x0_adjust_fn = x0_adjust_fn)
+            img, pred_x0 = outs
+            if torch.any(torch.isnan(img)): img = img_a
+            if callback: callback(i)
+            if img_callback: img_callback(pred_x0, i)
 
             if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
@@ -195,23 +177,10 @@ class DDIMSampler(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, cond_fn = None, 
-                      #scale_steps = 0, scale_factor = 1.5, scale_div=8,
-                      x_adjust_fn = None):
-        #TEST upscaling 200
-#        if index not in scale_steps:
-        b, *_, device = *x.shape, x.device
-#        else:
-            #x_decoded = self.model.decode_first_stage(x)
-            #x_encoded = self.model.encode_first_stage(x_decoded).sample()
-            #fac = (x_encoded/x).mean(0).mean(0).mean(0).mean(0)
-            #x_decoded = resize(x_decoded, scale_factors=scale_factor, interp_method=interp_methods.linear)
-            #x_encoded = self.model.encode_first_stage(x_decoded).sample()
-            #x = x_encoded.div(scale_div)
-            # x = resize(x, scale_factors=scale_factor, interp_method=interp_methods.linear, antialiasing=True) 
-            # x = x + torch.randn(*x.shape).cuda()*0.01
-            # x = x.div(scale_div)
-            # b, *_, device = *x.shape, x.device
+                      x_adjust_fn = None, x0_adjust_fn = None):
 
+
+        b, *_, device = *x.shape, x.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             e_t = self.model.apply_model(x, t, c)
@@ -245,9 +214,11 @@ class DDIMSampler(object):
 
         # current prediction for x_0
         pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+        
         if quantize_denoised:
             pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
         # direction pointing to x_t
+        if x0_adjust_fn is not None:  pred_x0 = x0_adjust_fn(pred_x0,t)
         dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
         noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
         if noise_dropout > 0.:

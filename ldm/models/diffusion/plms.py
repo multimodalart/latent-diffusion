@@ -2,7 +2,7 @@
 
 import torch
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from functools import partial
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
@@ -21,11 +21,12 @@ class PLMSSampler(object):
                 attr = attr.to(torch.device("cuda"))
         setattr(self, name, attr)
 
-    def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
-        if ddim_eta != 0:
-            raise ValueError('ddim_eta must be 0 for PLMS')
-        self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
-                                                  num_ddpm_timesteps=self.ddpm_num_timesteps,verbose=verbose)
+    def make_schedule(self, ddim_num_steps, custom_schedule, ddim_discretize="uniform", ddim_eta=0., ddim_eta_end = 0.,verbose=True):
+        if custom_schedule is None:
+            self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
+                                                    num_ddpm_timesteps=self.ddpm_num_timesteps,verbose=verbose)
+        else:
+            self.ddim_timesteps = custom_schedule
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
         to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
@@ -44,7 +45,7 @@ class PLMSSampler(object):
         # ddim sampling parameters
         ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(alphacums=alphas_cumprod.cpu(),
                                                                                    ddim_timesteps=self.ddim_timesteps,
-                                                                                   eta=ddim_eta,verbose=verbose)
+                                                                                   eta_start=ddim_eta,eta_end = ddim_eta_end,verbose=verbose)        
         self.register_buffer('ddim_sigmas', ddim_sigmas)
         self.register_buffer('ddim_alphas', ddim_alphas)
         self.register_buffer('ddim_alphas_prev', ddim_alphas_prev)
@@ -65,6 +66,7 @@ class PLMSSampler(object):
                img_callback=None,
                quantize_x0=False,
                eta=0.,
+               eta_end = None,
                mask=None,
                x0=None,
                temperature=1.,
@@ -76,6 +78,8 @@ class PLMSSampler(object):
                log_every_t=100,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
+               cond_fn = None,
+               custom_schedule = None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -88,7 +92,7 @@ class PLMSSampler(object):
                 if conditioning.shape[0] != batch_size:
                     print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
 
-        self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
+        self.make_schedule(ddim_num_steps=S, custom_schedule = custom_schedule, ddim_eta=eta, ddim_eta_end=eta_end, verbose=verbose)
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
@@ -108,6 +112,7 @@ class PLMSSampler(object):
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
+                                                    cond_fn = cond_fn
                                                     )
         return samples, intermediates
 
@@ -117,7 +122,7 @@ class PLMSSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None, cond_fn = None):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -155,7 +160,7 @@ class PLMSSampler(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      old_eps=old_eps, t_next=ts_next)
+                                      old_eps=old_eps, t_next=ts_next, cond_fn = cond_fn)
             img, pred_x0, e_t = outs
             old_eps.append(e_t)
             if len(old_eps) >= 4:
@@ -172,10 +177,17 @@ class PLMSSampler(object):
     @torch.no_grad()
     def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None, old_eps=None, t_next=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None, old_eps=None, t_next=None, cond_fn = None):
         b, *_, device = *x.shape, x.device
 
-        def get_model_output(x, t):
+        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
+        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
+        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
+        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
+        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
+        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
+        def get_model_output(x, t, cond_fn = None, sqrt_one_minus_at = sqrt_one_minus_at, a_t = a_t):
+
             if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
                 e_t = self.model.apply_model(x, t, c)
             else:
@@ -185,16 +197,26 @@ class PLMSSampler(object):
                 e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
                 e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
-            if score_corrector is not None:
+            if (score_corrector is not None) and ("latent" in corrector_kwargs):
                 assert self.model.parameterization == "eps"
-                e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
+                e_t = score_corrector.modify_score(e_t, e_t_uncond)
 
+            if cond_fn is not None:
+                # Conditioning for DDIM: "Diffusion Models Beat GANs on Image Synthesis" page 7-8.
+                pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+                temp = sqrt_one_minus_at * cond_fn(pred_x0, t)
+            
+                if score_corrector is not None and ("cond_fn" in corrector_kwargs):
+                    assert self.model.parameterization == "eps"
+                    e_t = score_corrector.modify_score(e_t, e_t_uncond)
+            
+                e_t = e_t - temp
+            
+            if score_corrector is not None and ("all" in corrector_kwargs):
+                assert self.model.parameterization == "eps"
+                e_t = score_corrector.modify_score(e_t, e_t_uncond)
+            
             return e_t
-
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
 
         def get_x_prev_and_pred_x0(e_t, index):
             # select parameters corresponding to the currently considered timestep
@@ -215,7 +237,7 @@ class PLMSSampler(object):
             x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
             return x_prev, pred_x0
 
-        e_t = get_model_output(x, t)
+        e_t = get_model_output(x, t, cond_fn = cond_fn)
         if len(old_eps) == 0:
             # Pseudo Improved Euler (2nd order)
             x_prev, pred_x0 = get_x_prev_and_pred_x0(e_t, index)
