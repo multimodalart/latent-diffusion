@@ -206,10 +206,6 @@ class PLMSSampler(object):
                 pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
                 temp = sqrt_one_minus_at * cond_fn(pred_x0, t)
             
-                if score_corrector is not None and ("cond_fn" in corrector_kwargs):
-                    assert self.model.parameterization == "eps"
-                    e_t = score_corrector.modify_score(e_t, e_t_uncond)
-            
                 e_t = e_t - temp
             
             if score_corrector is not None and ("all" in corrector_kwargs):
